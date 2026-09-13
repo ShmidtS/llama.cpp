@@ -170,6 +170,14 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, flags);
             layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, flags);
 
+            // HAGI POD: optional rotation tensors (absent -> disabled per layer)
+            layer.ffn_pod_p  = create_tensor(tn(LLM_TENSOR_FFN_POD_P,  "weight", i), {n_embd, n_embd}, TENSOR_NOT_REQUIRED);
+            layer.ffn_pod_mu = create_tensor(tn(LLM_TENSOR_FFN_POD_MU, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+            // HAGI: optional expert biases (POD mu-compensation lives here)
+            layer.ffn_up_exps_b   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_B,   "weight", i), {n_ff_exp, n_expert}, TENSOR_NOT_REQUIRED);
+            layer.ffn_gate_exps_b = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_B, "weight", i), {n_ff_exp, n_expert}, TENSOR_NOT_REQUIRED);
+            layer.ffn_down_exps_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_B, "weight", i), {n_embd,   n_expert}, TENSOR_NOT_REQUIRED);
+
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        n_ff_exp * n_expert_shared, n_embd}, flags);
             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
@@ -412,6 +420,18 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
+        // HAGI: dump MoE input activations for POD calibration (env-gated, prefill only)
+        static const bool hagi_dump = getenv("HAGI_DUMP_MOE") != nullptr;
+        if (res && hagi_dump) {
+            if (res->t_moe_in.empty()) {
+                res->t_moe_in.resize(model.hparams.n_layer(), nullptr);
+            }
+            // snapshot: dedicated node, force-evaluated so it is not optimized away
+            ggml_tensor * snap = ggml_dup(ctx0, cur);
+            ggml_build_forward_expand(gf, snap);
+            res->t_moe_in[il] = snap;
+        }
+
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             cur = build_ffn(cur,
                     layer.ffn_up,   nullptr, nullptr,
@@ -420,18 +440,45 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                    layer.ffn_gate_inp,
+            // HAGI POD (terni4): routed experts operate on z = (x - mu) @ P;
+            // router logits stay on the un-rotated x (DSV4 lesson).
+            ggml_tensor * moe_router_logits = nullptr;
+            ggml_tensor * moe_in = cur;
+            if (layer.ffn_pod_p != nullptr) {
+                ggml_tensor * x2d  = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
+                ggml_tensor * mu2d = ggml_reshape_2d(ctx0, layer.ffn_pod_mu, n_embd, 1);
+                ggml_tensor * xmu  = ggml_sub(ctx0, x2d, ggml_repeat(ctx0, mu2d, x2d));
+                moe_in = ggml_mul_mat(ctx0, layer.ffn_pod_p, xmu); // [n_embd, n_tokens]
+                if (getenv("HAGI_DUMP_MOE_IN") && res->t_moe_in[il] != nullptr) {
+                    ggml_tensor * snap_in = ggml_dup(ctx0, moe_in);
+                    ggml_build_forward_expand(gf, snap_in);
+                    res->t_moe_in[il] = snap_in;
+                }
+                moe_router_logits = ggml_mul_mat(ctx0, layer.ffn_gate_inp, x2d); // [n_expert, n_tokens]
+            }
+            ggml_tensor * moe_out = build_moe_ffn(moe_in,
+                    layer.ffn_pod_p != nullptr ? nullptr : layer.ffn_gate_inp,
+                    nullptr,                     /* gate_inp_b */
                     layer.ffn_up_exps,
+                    layer.ffn_up_exps_b,
                     layer.ffn_gate_exps,
+                    layer.ffn_gate_exps_b,
                     layer.ffn_down_exps,
+                    layer.ffn_down_exps_b,
                     layer.ffn_exp_probs_b,
                     n_expert, n_expert_used,
                     LLM_FFN_SILU, hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
+                    il,
+                    moe_router_logits);      /* probs_in: pre-bias logits from x */
             cb(moe_out, "ffn_moe_out", il);
+            if (getenv("HAGI_DUMP_MOE_OUT") && res) {
+                if (res->t_moe_out.empty()) res->t_moe_out.resize(model.hparams.n_layer(), nullptr);
+                ggml_tensor * snap_mo = ggml_dup(ctx0, moe_out);
+                ggml_build_forward_expand(gf, snap_mo);
+                res->t_moe_out[il] = snap_mo;
+            }
 
             ggml_tensor * ffn_shexp = build_ffn(cur,
                     layer.ffn_up_shexp,   nullptr, nullptr,
@@ -747,6 +794,16 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
     kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
     cb(kv_cmpr, "kv_cmpr", il);
+    // HAGI: dump KV latent (post-norm) for KVP phase 2 (env-gated, res list reuse)
+    if (getenv("HAGI_DUMP_KV") && res && res->t_moe_in.empty()) {
+        res->t_moe_in.resize(model.hparams.n_layer(), nullptr);
+    }
+    if (getenv("HAGI_DUMP_KV") && res && il < res->t_moe_in.size()) {
+        ggml_tensor * snap_kv = ggml_dup(ctx0, kv_cmpr);
+        ggml_build_forward_expand(gf, snap_kv);
+        res->t_moe_in[il] = snap_kv;
+    }
+
 
     // absorb wk_b so the cache holds only the latent
     ggml_tensor * q_absorbed = ggml_permute(ctx0, q, 0, 2, 1, 3);

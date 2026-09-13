@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include <map>
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1560,7 +1561,6 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
     }
 
-    // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
 
@@ -1884,6 +1884,56 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
         }
+
+    // HAGI: dump per-layer MoE inputs (POD calibration). Enabled by env HAGI_DUMP_MOE=<dir>.
+    {
+        const char * dump_dir = getenv("HAGI_DUMP_MOE");
+        if (dump_dir && res) {
+            static const uint32_t dump_layers[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44};
+            static std::map<uint32_t, int64_t> left;
+            for (uint32_t il : dump_layers) {
+                if (left.find(il) == left.end()) left[il] = 8;
+                if (left[il] <= 0) continue;
+                ggml_tensor * t = res->get_moe_in(il);
+                if (!t) continue;
+                ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                if (!backend_t) continue;
+                const int64_t n = t->ne[1]; // n_tokens
+                const int64_t e = t->ne[0]; // n_embd
+                std::vector<float> buf((size_t)(n*e));
+                ggml_backend_tensor_get_async(backend_t, t, buf.data(), 0, buf.size()*sizeof(float));
+                char path[1024];
+                const char * kv_mode = getenv("HAGI_DUMP_KV");
+                snprintf(path, sizeof(path), "%s/%s_L%u_%lld.f32", dump_dir,
+                         kv_mode ? "kv_lat" : "moe_in", il, (long long)(8 - left[il]));
+                FILE * f = fopen(path, "wb");
+                if (f) { fwrite(buf.data(), sizeof(float), buf.size(), f); fclose(f); }
+                left[il]--;
+            }
+        }
+        const char * dump_dir2 = getenv("HAGI_DUMP_MOE_OUT");
+        if (dump_dir2 && res && !res->t_moe_out.empty()) {
+            static const uint32_t dump_layers2[] = {3, 8, 16, 24, 32, 40, 44};
+            static std::map<uint32_t, int64_t> left2;
+            for (uint32_t il : dump_layers2) {
+                if (left2.find(il) == left2.end()) left2[il] = 4;
+                if (left2[il] <= 0) continue;
+                ggml_tensor * t = res->get_moe_out(il);
+                if (!t) continue;
+                ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                if (!backend_t) continue;
+                const int64_t n = t->ne[1];
+                const int64_t e = t->ne[0];
+                std::vector<float> buf((size_t)(n*e));
+                ggml_backend_tensor_get_async(backend_t, t, buf.data(), 0, buf.size()*sizeof(float));
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/moe_out_L%u_%lld.f32", dump_dir2, il, (long long)(4 - left2[il]));
+                FILE * f = fopen(path, "wb");
+                if (f) { fwrite(buf.data(), sizeof(float), buf.size(), f); fclose(f); }
+                left2[il]--;
+            }
+        }
+    }
 
         // extract embeddings
         if (embd.data && t_embd && n_outputs > 0) {

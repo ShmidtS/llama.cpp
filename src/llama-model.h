@@ -340,6 +340,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps_b   = nullptr;
     struct ggml_tensor * ffn_up_exps_b     = nullptr;
     struct ggml_tensor * ffn_gate_up_exps_b = nullptr;
+    // HAGI POD rotation (terni4): z = (x - mu) @ P applied before routed experts
+    struct ggml_tensor * ffn_pod_p         = nullptr;
+    struct ggml_tensor * ffn_pod_mu        = nullptr;
 
     // ff MoE per-expert scales (NVFP4 per-tensor scale2)
     struct ggml_tensor * ffn_gate_exps_s   = nullptr;
